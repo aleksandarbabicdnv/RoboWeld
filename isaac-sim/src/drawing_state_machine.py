@@ -1,7 +1,7 @@
 """Pure-Python N-stroke drawing state machine."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 import numpy as np
@@ -21,6 +21,11 @@ class MotionTarget:
     stroke_id: int
     waypoint_index: int
     pen_down: bool
+    # Optional per-target pen orientation (wxyz) and pen force target (N), set by a surface
+    # challenge (src/surface_challenge.py). None keeps the configured fixed orientation and no
+    # force target, so every existing caller behaves exactly as before.
+    orientation_wxyz: Optional[np.ndarray] = field(default=None, compare=False)
+    force_n: Optional[float] = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

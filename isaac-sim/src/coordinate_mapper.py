@@ -69,6 +69,10 @@ def map_trajectory_to_plane(
 
     A single global scale is used, so aspect ratio and relative stroke placement
     are preserved. Image +Y is flipped by default to become drawing-plane +Y.
+
+    A trajectory with units "paper_m" (metres on the sheet, from the centre of the
+    drawing area, +y up) is placed as it is: no scaling and no flip, because its
+    strokes trace lines that are already at a known place on the paper.
     """
     center = np.asarray(center_xy, dtype=np.float64)
     size = np.asarray(size_xy, dtype=np.float64)
@@ -77,6 +81,9 @@ def map_trajectory_to_plane(
     all_points = np.vstack([np.asarray(s["points"], dtype=np.float64) for s in trajectory["strokes"]])
     if not np.isfinite(all_points).all():
         raise ValueError("Non-finite trajectory coordinate")
+    if trajectory.get("units") == "paper_m":
+        return _place_paper_metres(trajectory, all_points, center, size, max_step, smoothing_strength,
+                                   corner_angle_degrees)
     minimum, maximum = all_points.min(axis=0), all_points.max(axis=0)
     span = maximum - minimum
     active = span > 1e-12
@@ -106,6 +113,36 @@ def map_trajectory_to_plane(
             "source_bbox": [minimum.tolist(), maximum.tolist()],
             "uniform_scale": scale,
             "image_y_flipped": bool(flip_image_y),
+        },
+    }
+
+
+def _place_paper_metres(trajectory, all_points, center, size, max_step, smoothing_strength, corner_angle_degrees,
+                        tolerance_m: float = 0.005):
+    half = size / 2.0 + tolerance_m
+    if np.any(np.abs(all_points) > half):
+        worst = np.abs(all_points).max(axis=0)
+        raise ValueError(
+            f"paper_m strokes reach {worst.tolist()} m from the centre, outside the drawing area "
+            f"{(size / 2.0).tolist()} m (+{tolerance_m} m)"
+        )
+    mapped_strokes: List[Dict[str, Any]] = []
+    for stroke in trajectory["strokes"]:
+        mapped = np.asarray(stroke["points"], dtype=np.float64) + center
+        mapped = corner_preserving_smooth(mapped, smoothing_strength, corner_angle_degrees)
+        mapped = resample_polyline(mapped, max_step)
+        mapped_strokes.append({"stroke_id": int(stroke["stroke_id"]), "points": mapped.tolist()})
+    return {
+        "drawing_id": str(trajectory["drawing_id"]),
+        "strokes": mapped_strokes,
+        "mapping": {
+            "units": "metres",
+            "source_units": "paper_m",
+            "center_xy": center.tolist(),
+            "size_xy": size.tolist(),
+            "source_bbox": [all_points.min(axis=0).tolist(), all_points.max(axis=0).tolist()],
+            "uniform_scale": 1.0,
+            "image_y_flipped": False,
         },
     }
 

@@ -1,0 +1,81 @@
+# Surface challenges for the drawing runner: scripts/run_two_stroke_drawing.py --challenge NAME
+# (src/surface_challenge.py). Each preset changes the sheet, the pen angle and/or the pen force;
+# the drawing itself, the robot and the calibration configs are untouched. Lengths in metres,
+# angles in degrees, forces in newtons.
+#
+#   surface:     kind flat | tilted (tilt_deg [about world x, about world y], pivot low_edge|center)
+#                | bumps (list of {center_uv_m [u, v], height_m, sigma_m}); u, v are metres from
+#                the centre of the drawing area.
+#   pen_tilt:    mode travel (lead_deg: pen top trails the direction of travel; side_deg: leans
+#                left of travel) | fixed (top leans toward world azimuth top_azimuth_deg)
+#                | none. follow_normal: tilt relative to the surface normal (default) or to
+#                world vertical.
+#   pen_spring:  spring-loaded holder model (src/pen_spring.py). With a spring the sheet has no
+#                collision: the model, not a rigid contact, sets the force.
+#   pen_force:   force target while drawing: constant (target_n) | ramp (start_n, end_n)
+#                | sine (mean_n, amplitude_n, period_m). Needs pen_spring.
+#
+# The challenge levels below go from easiest to hardest. Only the IK controllers (ik, ik_stream)
+# run them: the trained ACT and SmolVLA policies know only the flat sheet and a vertical pen.
+
+defaults:
+  tangent_smoothing_m: 0.006     # travel direction for the lead angle is averaged over this
+  ink_tolerance_m: 0.0005        # no spring: the tip inks within this of its touching height
+  coverage_tolerance_m: 0.001    # a planned point counts as inked if ink is this close
+  force_band_n: 0.5              # "in band" when |force - target| is at most this
+
+challenges:
+  # Sanity check: must reproduce a plain run exactly (same targets, same metrics).
+  flat:
+    surface: {kind: flat}
+
+  # Level 1: flat sheet, tilted pen.
+  pen_lead_15:
+    pen_tilt: {mode: travel, lead_deg: 15}
+  pen_fixed_20:
+    pen_tilt: {mode: fixed, lead_deg: 20, top_azimuth_deg: 180}   # pen top leans toward the robot base (-x)
+
+  # Level 2: tilted sheet. The lowest corner stays on the original paper height.
+  tilted_8:
+    surface: {kind: tilted, tilt_deg: [0, 8]}
+  tilted_8_6:
+    surface: {kind: tilted, tilt_deg: [6, 8]}
+  tilted_8_6_lead_10:
+    surface: {kind: tilted, tilt_deg: [6, 8]}
+    pen_tilt: {mode: travel, lead_deg: 10}
+
+  # Level 3: bumpy sheet with a known shape (steepest slope about 14 deg).
+  bumps_3:
+    surface:
+      kind: bumps
+      bumps:
+        - {center_uv_m: [-0.040, 0.020], height_m: 0.006, sigma_m: 0.015}
+        - {center_uv_m: [0.035, -0.015], height_m: 0.004, sigma_m: 0.012}
+        - {center_uv_m: [0.010, 0.035], height_m: 0.003, sigma_m: 0.020}
+
+  # Pressure on the flat sheet: hold 1.5 N through a spring-loaded holder.
+  spring_constant:
+    pen_spring: {stiffness_n_per_m: 500, preload_n: 0.3, travel_m: 0.005, ink_threshold_n: 0.2}
+    pen_force: {profile: constant, target_n: 1.5}
+
+  # Level 5: a pressure profile along every stroke (line width follows it).
+  spring_sine:
+    pen_spring: {stiffness_n_per_m: 500, preload_n: 0.3, travel_m: 0.005, ink_threshold_n: 0.2}
+    pen_force: {profile: sine, mean_n: 1.5, amplitude_n: 0.7, period_m: 0.03}
+
+  # Everything at once.
+  tilted_lead_spring_ramp:
+    surface: {kind: tilted, tilt_deg: [6, 8]}
+    pen_tilt: {mode: travel, lead_deg: 10}
+    pen_spring: {stiffness_n_per_m: 500, preload_n: 0.3, travel_m: 0.005, ink_threshold_n: 0.2}
+    pen_force: {profile: ramp, start_n: 0.8, end_n: 2.2}
+
+# Path A camera: a straight-down camera that photographs the template on the sheet
+# (run_two_stroke_drawing.py --template-image). The robot is added after the photo, so it
+# never hides the sheet.
+template_camera:
+  height_above_sheet_m: 0.60
+  resolution_px: 1024
+  view_margin_m: 0.02            # extra width seen around the drawing area on each side
+  warmup_frames: 90              # renderer frames before the photo (textures load async)
+  border_m: 0.002                # ignore lines this close to the edge of the drawing area

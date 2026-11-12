@@ -27,6 +27,25 @@ def nearest_path_errors(reference: Sequence[Sequence[float]], samples: Sequence[
     return np.min(np.linalg.norm(samples_array[:, None, :] - reference_array[None, :, :], axis=2), axis=1)
 
 
+def nearest_distances(reference: Sequence[Sequence[float]], samples: Sequence[Sequence[float]],
+                      chunk: int = 2048) -> np.ndarray:
+    """Same as nearest_path_errors, in blocks of `chunk` samples, so long runs never build an
+    N x M x D array (20k samples against 2k path points would be ~1 GB)."""
+    reference_array = np.asarray(reference, dtype=np.float64)
+    samples_array = np.asarray(samples, dtype=np.float64)
+    if reference_array.ndim != 2 or samples_array.ndim != 2 or reference_array.shape[1] != samples_array.shape[1]:
+        raise ValueError("Paths must be NxD arrays with the same D")
+    if len(reference_array) == 0 or len(samples_array) == 0:
+        raise ValueError("Paths must be non-empty")
+    ref_sq = (reference_array * reference_array).sum(axis=1)[None, :]
+    out = np.empty(len(samples_array))
+    for start in range(0, len(samples_array), chunk):
+        block = samples_array[start:start + chunk]
+        d2 = (block * block).sum(axis=1)[:, None] - 2.0 * block @ reference_array.T + ref_sq
+        out[start:start + chunk] = np.sqrt(np.maximum(d2.min(axis=1), 0.0))
+    return out
+
+
 def summarize_errors(errors: Sequence[float]) -> Dict[str, float]:
     values = np.asarray(errors, dtype=np.float64)
     if values.size == 0 or not np.isfinite(values).all():

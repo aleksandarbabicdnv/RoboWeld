@@ -57,6 +57,24 @@ def _parse_args():
         help="Diagnostics: paper without collision, to tell gripper-paper contact from tracking error",
     )
     parser.add_argument("--policy-address", default="127.0.0.1:8790", help="act_policy_server.py host:port")
+    parser.add_argument(
+        "--challenge",
+        default=None,
+        help="Surface challenge preset from config/surface_challenges.yaml: tilted or bumpy sheet, tilted pen, "
+             "spring-pen force target (src/surface_challenge.py). IK controllers only.",
+    )
+    parser.add_argument("--challenge-file", default=None, help="Use another presets file instead")
+    parser.add_argument(
+        "--template-image",
+        default=None,
+        help="Path A: put this image on the sheet, photograph it with a straight-down camera, and draw the "
+             "lines found in the photo (scripts/make_template_image.py makes test images)",
+    )
+    parser.add_argument(
+        "--template-truth",
+        default=None,
+        help="With --template-image: paper_m trajectory of the template's true lines, to score the extraction",
+    )
     # Defaults run the 30 fps policy at 60 Hz with half-size steps. Holding each
     # 30 Hz step for two physics steps tracked well but its command staircase
     # gave ~25% more joint jerk than IK; ramping the held step instead made the
@@ -287,6 +305,54 @@ def _write_diagnostics(path: Path, rows) -> None:
     plt.close(figure)
 
 
+def _photograph_template(stage, surface, drawing, output_dir: Path):
+    """Path A: template on the sheet -> straight-down photo -> strokes in paper metres."""
+    import numpy as np
+    from PIL import Image
+
+    from surface_challenge import load_presets
+    from surface_scene import TEMPLATE_CAMERA_PRIM, apply_template, capture_rgb, ensure_light, template_camera
+    from template_strokes import compare_strokes, extract_strokes, polyline_length, strokes_to_trajectory
+    from trajectory_loader import load_trajectory
+
+    camera_cfg = load_presets(ARGS.challenge_file).get("template_camera") or {}
+    size = [float(v) for v in drawing["surface_size_xy_m"]]
+    image_path = Path(ARGS.template_image).resolve()
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Template image not found: {image_path}")
+    ensure_light(stage)
+    apply_template(stage, surface, size, str(image_path))
+    mapping = template_camera(
+        stage, surface, size,
+        height_above_sheet_m=float(camera_cfg.get("height_above_sheet_m", 0.6)),
+        view_margin_m=float(camera_cfg.get("view_margin_m", 0.02)),
+        border_m=float(camera_cfg.get("border_m", 0.002)),
+    )
+    resolution = int(camera_cfg.get("resolution_px", 1024))
+    photo = capture_rgb(TEMPLATE_CAMERA_PRIM, (resolution, resolution), simulation_app.update,
+                        int(camera_cfg.get("warmup_frames", 90)))
+    Image.fromarray(photo).save(output_dir / "template_camera.png")
+    result = extract_strokes(photo, mapping)
+    if not result.strokes:
+        raise RuntimeError("No lines found in the template photo (see template_camera.png)")
+    trajectory = strokes_to_trajectory(result.strokes, f"template_{image_path.stem}", source_image=str(image_path))
+    (output_dir / "template_strokes.json").write_text(json.dumps(trajectory, indent=1), encoding="utf-8")
+    report = {
+        "image": str(image_path),
+        "camera_resolution_px": resolution,
+        "pixel_size_m": result.pixel_size_m,
+        "threshold": result.threshold,
+        "ink_pixels": result.ink_pixels,
+        "strokes": len(result.strokes),
+        "stroke_length_m": float(sum(polyline_length(s) for s in result.strokes)),
+    }
+    if ARGS.template_truth:
+        truth = load_trajectory(ARGS.template_truth)
+        report["vs_truth"] = compare_strokes(result.strokes, [np.asarray(s["points"]) for s in truth["strokes"]])
+    print(f"[OK] Template photo: {json.dumps(report)}")
+    return trajectory, report
+
+
 def main() -> int:
     import numpy as np
     from isaacsim.core.api import World
@@ -346,7 +412,13 @@ def main() -> int:
         raise RuntimeError("Configured IK frame does not match the generated fixed pen-tip frame")
 
     trajectory_path = ARGS.trajectory or config["project"]["trajectory_path"]
-    trajectory = load_trajectory(trajectory_path, first_n_strokes=ARGS.first_n_strokes)
+    if ARGS.template_image:
+        # Path A: the strokes come from photographing the template, once the sheet exists.
+        if ARGS.augment_seed is not None:
+            raise RuntimeError("--template-image draws the lines where they are; it cannot be combined with --augment-seed")
+        trajectory = None
+    else:
+        trajectory = load_trajectory(trajectory_path, first_n_strokes=ARGS.first_n_strokes)
     if ARGS.paper_shift is not None:
         dx, dy, dz = (float(v) for v in ARGS.paper_shift)
         center = drawing["surface_center_xy_m"]
@@ -374,15 +446,28 @@ def main() -> int:
         )
         trajectory = reverse_strokes(trajectory, augmentation["reversed_strokes"])
         print(f"[OK] Augmentation: {augmentation}")
-    mapped = map_trajectory_to_plane(
-        trajectory,
-        center_xy=drawing["surface_center_xy_m"],
-        size_xy=drawing["surface_size_xy_m"],
-        flip_image_y=bool(drawing["flip_image_y"]),
-        max_step=float(drawing["max_cartesian_step_m"]),
-        smoothing_strength=float(drawing["smoothing_strength"]),
-        corner_angle_degrees=float(drawing["corner_angle_degrees"]),
-    )
+    def _map(trajectory):
+        return map_trajectory_to_plane(
+            trajectory,
+            center_xy=drawing["surface_center_xy_m"],
+            size_xy=drawing["surface_size_xy_m"],
+            flip_image_y=bool(drawing["flip_image_y"]),
+            max_step=float(drawing["max_cartesian_step_m"]),
+            smoothing_strength=float(drawing["smoothing_strength"]),
+            corner_angle_degrees=float(drawing["corner_angle_degrees"]),
+        )
+
+    mapped = _map(trajectory) if trajectory is not None else None
+
+    challenge = None
+    if ARGS.challenge:
+        from surface_challenge import Challenge
+
+        challenge = Challenge.load(ARGS.challenge, drawing, presets_path=ARGS.challenge_file)
+        challenge.check_controller(ARGS.controller)
+        if ARGS.policy_assist:
+            raise RuntimeError("--policy-assist is for the ACT controller; surface challenges run with IK")
+        print(f"[OK] Surface challenge: {json.dumps(challenge.describe())}")
 
     enable_extension("isaacsim.asset.importer.urdf")
     enable_extension("isaacsim.robot_motion.motion_generation")
@@ -409,18 +494,39 @@ def main() -> int:
     paper_thickness = 0.01
     from isaacsim.core.api.objects import VisualCuboid
 
-    paper_class = VisualCuboid if ARGS.paper_visual_only else FixedCuboid
-    world.scene.add(
-        paper_class(
-            prim_path="/World/DrawingSurface",
-            name="drawing_surface",
-            position=np.asarray(
-                [*drawing["surface_center_xy_m"], float(drawing["paper_top_z_m"]) - paper_thickness / 2]
-            ),
-            scale=np.asarray([paper_size[0], paper_size[1], paper_thickness]),
-            color=np.asarray([0.92, 0.92, 0.88]),
+    # A spring-pen challenge presses below the touching height, so its sheet has no collision.
+    sheet_collides = not ARGS.paper_visual_only and (challenge is None or challenge.sheet_collision)
+    if challenge is not None and challenge.surface.kind != "flat":
+        from surface_scene import author_sheet
+
+        author_sheet(world.stage, challenge.surface, drawing["surface_size_xy_m"], collision=sheet_collides)
+    else:
+        paper_class = FixedCuboid if sheet_collides else VisualCuboid
+        world.scene.add(
+            paper_class(
+                prim_path="/World/DrawingSurface",
+                name="drawing_surface",
+                position=np.asarray(
+                    [*drawing["surface_center_xy_m"], float(drawing["paper_top_z_m"]) - paper_thickness / 2]
+                ),
+                scale=np.asarray([paper_size[0], paper_size[1], paper_thickness]),
+                color=np.asarray([0.92, 0.92, 0.88]),
+            )
         )
-    )
+    template_report = None
+    if ARGS.template_image:
+        # Photograph before the robot exists, so the arm can never hide the sheet.
+        from paper_surface import make_surface
+
+        template_surface = challenge.surface if challenge is not None else make_surface(
+            None, center_xy=drawing["surface_center_xy_m"], sheet_z=float(drawing["paper_top_z_m"]),
+            size_xy=drawing["surface_size_xy_m"],
+        )
+        trajectory, template_report = _photograph_template(world.stage, template_surface, drawing, output_dir)
+        if ARGS.first_n_strokes:
+            trajectory = {**trajectory, "strokes": trajectory["strokes"][: ARGS.first_n_strokes]}
+        trajectory_path = output_dir / "template_strokes.json"
+        mapped = _map(trajectory)
     reference_root = add_robot_reference(usd_path, robot_config["prim_path"])
     for _ in range(10):
         simulation_app.update()
@@ -430,14 +536,15 @@ def main() -> int:
     prepare_articulation_solver(world.stage, articulation_root, robot_config)
     robot = world.scene.add(SingleArticulation(prim_path=articulation_root, name="xarm7"))
 
-    _create_curve(
-        world.stage,
-        "/World/DesiredDrawing",
-        mapped["strokes"],
-        float(drawing["pen_down_z_m"]),
-        (0.1, 0.85, 0.2),
-        0.002,
-    )
+    if challenge is None:  # a challenge draws its desired path on the surface once targets exist
+        _create_curve(
+            world.stage,
+            "/World/DesiredDrawing",
+            mapped["strokes"],
+            float(drawing["pen_down_z_m"]),
+            (0.1, 0.85, 0.2),
+            0.002,
+        )
     first_point = np.r_[mapped["strokes"][0]["points"][0], drawing["approach_height_m"]]
     target_marker = world.scene.add(
         VisualSphere(
@@ -499,18 +606,32 @@ def main() -> int:
         corner_densify_factor=int(drawing["corner_densify_factor"]),
         short_hop_m=float(drawing.get("short_hop_m", 0.0)),
     )
+    if challenge is not None:
+        # Same plan, moved onto the surface, with a pen orientation and force target per waypoint.
+        phases = challenge.apply(phases)
+        from surface_scene import curve
+
+        curve(world.stage, "/World/DesiredDrawing", list(challenge.desired_tip_strokes().values()),
+              (0.1, 0.85, 0.2), 0.002)
     # Enforce max step from the actual simulated home pen pose to first approach.
     home_tip, _ = ik.end_effector_pose()
     approach_phase = phases[0]
     final_approach = approach_phase.targets[-1]
-    approach_points = interpolate_segment(home_tip, final_approach.position, float(drawing["max_cartesian_step_m"]))[1:]
-    phases[0] = Phase(
-        approach_phase.state,
-        [
-            MotionTarget(approach_phase.state, point, final_approach.stroke_id, index, False)
-            for index, point in enumerate(approach_points)
-        ],
-    )
+    if challenge is not None:
+        # Also turn the pen from its home orientation to the first drawing orientation on the way.
+        phases[0] = challenge.home_leg(
+            approach_phase.state, home_tip, np.asarray(drawing["orientation_wxyz"], dtype=np.float64),
+            final_approach, float(drawing["max_cartesian_step_m"]),
+        )
+    else:
+        approach_points = interpolate_segment(home_tip, final_approach.position, float(drawing["max_cartesian_step_m"]))[1:]
+        phases[0] = Phase(
+            approach_phase.state,
+            [
+                MotionTarget(approach_phase.state, point, final_approach.stroke_id, index, False)
+                for index, point in enumerate(approach_points)
+            ],
+        )
     machine = MultiStrokeStateMachine(phases, float(safety["waypoint_timeout_s"]))
     desired_targets = flatten_desired_targets(phases)
     _workspace_check(desired_targets, safety["workspace_min_m"], safety["workspace_max_m"])
@@ -596,6 +717,13 @@ def main() -> int:
         int(stroke["stroke_id"]): [[*point, float(drawing["pen_down_z_m"])] for point in stroke["points"]]
         for stroke in mapped["strokes"]
     }
+    if challenge is not None:
+        # The IK-frame path the drawing asks for on the surface (what the tracked tip is compared to).
+        desired_down_by_stroke = {
+            int(phase.targets[0].stroke_id): [t.position.tolist() for t in phase.targets]
+            for phase in phases
+            if phase.state.startswith("DRAW_STROKE_")
+        }
     actual_by_stroke = {int(stroke["stroke_id"]): [] for stroke in mapped["strokes"]}
     # Measured joints per pen-down stroke, for the joint-jerk smoothness metric.
     joints_by_stroke = {int(stroke["stroke_id"]): [] for stroke in mapped["strokes"]}
@@ -753,9 +881,16 @@ def main() -> int:
                                  carrot_arc + ARGS.ik_speed_m_s * physics_dt)
                 carrot = int(np.searchsorted(desired_arc, carrot_arc))
                 first = int(phase_offsets[phase_index])
-                action, success = ik.solve(desired_positions[min(max(carrot, first), last)], orientation)
+                carrot_target = desired_targets[min(max(carrot, first), last)]
+                action, success = ik.solve(
+                    carrot_target.position,
+                    orientation if carrot_target.orientation_wxyz is None else carrot_target.orientation_wxyz,
+                )
             else:
-                action, success = ik.solve(target.position if redraw_point is None else redraw_point, orientation)
+                action, success = ik.solve(
+                    target.position if redraw_point is None else redraw_point,
+                    orientation if target.orientation_wxyz is None else target.orientation_wxyz,
+                )
             if not success:
                 consecutive_ik_failures += 1
                 if consecutive_ik_failures >= max_ik_failures:
@@ -849,6 +984,8 @@ def main() -> int:
             )
             if ARGS.ik_gravity_comp:
                 executed_rows[-1]["max_gravity_offset_rad"] = float(np.max(np.abs(ik.last_gravity_offset_rad)))
+            if challenge is not None:
+                executed_rows[-1].update(challenge.measure(tip_position, tip_rotation, target))
             if target.pen_down:
                 actual_by_stroke[target.stroke_id].append(np.asarray(tip_position).tolist())
                 joints_by_stroke[target.stroke_id].append(q)
@@ -914,6 +1051,10 @@ def main() -> int:
     ]
     if ARGS.ik_gravity_comp:
         fields = fields + ["max_gravity_offset_rad"]
+    if challenge is not None:
+        from surface_challenge import ROW_FIELDS
+
+        fields = fields + ROW_FIELDS
     write_csv(output_dir / "executed_path.csv", executed_rows, fields)
     _write_comparison(
         output_dir / "two_stroke_comparison.png",
@@ -1029,6 +1170,11 @@ def main() -> int:
             }
     if reached_target_errors:
         metrics["waypoint_reach_error"] = summarize_errors(reached_target_errors)
+    if challenge is not None:
+        metrics["surface_challenge"] = challenge.summary([row for row in executed_rows if row["pen_down"]])
+    if template_report is not None:
+        metrics["template"] = template_report
+        metrics["trajectory_path"] = str(trajectory_path)
     if executed_down:
         metrics["executed_to_desired_nearest_path_error"] = summarize_errors(
             nearest_path_errors(desired_down, executed_down)

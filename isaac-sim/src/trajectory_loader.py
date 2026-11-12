@@ -11,6 +11,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 Trajectory = Dict[str, Any]
 
+# "paper_m": points are metres on the sheet, (u, v) from the centre of the drawing area with +v
+# along world +y (what scripts/template_to_strokes.py writes from a camera image). They are placed
+# as they are instead of being scaled to fit the drawing area (src/coordinate_mapper.py).
+SUPPORTED_UNITS = ("paper_m",)
+
 
 class TrajectoryError(ValueError):
     """Raised when trajectory data cannot be standardized safely."""
@@ -75,7 +80,13 @@ def standardize_trajectory(payload: Mapping[str, Any], *, drop_consecutive_dupli
         strokes.append({"stroke_id": stroke_id, "points": points})
     if not strokes:
         raise TrajectoryError("Trajectory has no strokes")
-    return {"drawing_id": str(drawing_id), "strokes": strokes}
+    result = {"drawing_id": str(drawing_id), "strokes": strokes}
+    units = payload.get("units")
+    if units not in (None, ""):
+        if units not in SUPPORTED_UNITS:
+            raise TrajectoryError(f"Unsupported units {units!r}; supported: {', '.join(SUPPORTED_UNITS)}")
+        result["units"] = str(units)
+    return result
 
 
 def _from_rows(rows: Iterable[Mapping[str, Any]], fallback_id: str) -> Trajectory:
@@ -176,7 +187,7 @@ def load_trajectory(path: str | Path, *, first_n_strokes: int | None = None) -> 
             raise TrajectoryError(
                 f"Requested {first_n_strokes} strokes but {trajectory['drawing_id']} has {len(trajectory['strokes'])}"
             )
-        trajectory = {"drawing_id": trajectory["drawing_id"], "strokes": trajectory["strokes"][:first_n_strokes]}
+        trajectory = {**trajectory, "strokes": trajectory["strokes"][:first_n_strokes]}
     return trajectory
 
 

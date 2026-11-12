@@ -336,6 +336,13 @@ robot remains stable under gravity should `rl.ppo_updates` be increased. The pro
 the target raster generated from the configured drawing input; camera rendering and parallel Isaac
 environments are the next steps before real-robot transfer.
 
+## Surface challenges and camera templates
+
+`run_two_stroke_drawing.py --challenge NAME` draws on a tilted or bumpy sheet, with a leaned pen and
+a spring-pen force target (presets in `config/surface_challenges.yaml`); `--template-image PNG`
+photographs line art on the sheet with a straight-down camera and draws the lines it finds. IK
+controllers only for now. Details, commands and metrics: `SURFACE_CHALLENGES.md`.
+
 ## Test result
 
 The launcher-only unit run executes 51 tests: 47 pass and four skip (three behavior-cloning tests
